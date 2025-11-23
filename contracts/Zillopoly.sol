@@ -7,180 +7,272 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title Zillopoly
- * @dev A simple guessing game where players bet on whether a random number will be under or over a threshold
- *
- * Game Rules:
- * - Players choose a threshold (1-99)
- * - Players bet HOBO tokens and guess "under" or "over"
- * - A random number (1-100) is generated
- * - If guess is correct: player wins 2x their bet
- * - If guess is wrong: player loses their bet
- *
- * WARNING: This uses block-based randomness which is NOT secure for production.
- * For production, use Chainlink VRF or similar oracle-based randomness.
+ * @dev Real estate guessing game with three stages:
+ * Stage 1: Initialize game with listing (displayed price shown)
+ * Stage 2: Player guesses if actual price is higher or lower than displayed price
+ * Stage 3: External oracle sets actual price and bet is settled
  */
 contract Zillopoly is Ownable, ReentrancyGuard {
     IERC20 public hoboToken;
-    uint256 public houseBalance;
-    uint256 public constant MIN_BET = 1e18; // 1 HOBO
-    uint256 public maxBet = 100e18; // 100 HOBO
 
-    enum Guess { UNDER, OVER }
+    uint256 public constant GAME_COST = 1000 * 10**18; // 1000 HOBO tokens
+    uint256 public nextGameId = 1;
 
-    struct GameResult {
-        address player;
-        uint256 betAmount;
-        uint256 threshold;
-        Guess guess;
-        uint256 rolledNumber;
-        bool won;
-        uint256 payout;
-        uint256 timestamp;
+    enum GameStage {
+        NotStarted,
+        Initialized,    // Stage 1: Listing created with displayed price
+        GuessSubmitted, // Stage 2: Player has made their guess
+        Settled         // Stage 3: Bet settled with actual price
     }
 
-    mapping(address => GameResult[]) public playerHistory;
-    GameResult[] public allGames;
+    struct Listing {
+        uint256 gameId;           // Unique auto-incremented game ID
+        uint256 displayedPrice;   // Price shown to player (set at initialization)
+        uint256 actualPrice;      // Real price (set at settlement by oracle)
+        bool higherOrLower;       // Player's guess: true = higher, false = lower
+        bytes32 listingId;        // Unique listing identifier
+        address player;           // Player who owns this game
+        uint256 timestamp;        // When game was created
+        GameStage stage;          // Current stage of the game
+        bool won;                 // Whether player won (set after settlement)
+        uint256 payout;           // Payout amount (set after settlement)
+    }
 
-    event GamePlayed(
+    // Mapping from player address to their listings
+    mapping(address => Listing[]) public playerListings;
+
+    // Mapping from gameId to listing (for easy lookup)
+    mapping(uint256 => Listing) public gameById;
+
+    // All games ever created
+    Listing[] public allGames;
+
+    event GameStarted(
+        uint256 indexed gameId,
         address indexed player,
-        uint256 betAmount,
-        uint256 threshold,
-        Guess guess,
-        uint256 rolledNumber,
+        bytes32 indexed listingId,
+        uint256 displayedPrice,
+        uint256 timestamp
+    );
+
+    event GuessMade(
+        uint256 indexed gameId,
+        address indexed player,
+        bool higherOrLower
+    );
+
+    event BetSettled(
+        uint256 indexed gameId,
+        address indexed player,
+        uint256 displayedPrice,
+        uint256 actualPrice,
+        bool higherOrLower,
         bool won,
         uint256 payout
     );
-    event HouseFunded(uint256 amount);
-    event HouseWithdrawn(uint256 amount);
-    event MaxBetUpdated(uint256 newMaxBet);
 
     constructor(address _hoboToken) Ownable(msg.sender) {
         hoboToken = IERC20(_hoboToken);
     }
 
     /**
-     * @dev Play the under/over game
-     * @param betAmount Amount of HOBO tokens to bet
-     * @param threshold The threshold number (1-99)
-     * @param guess Whether the random number will be UNDER or OVER the threshold
+     * @dev STAGE 1: Initialize game with listing
+     * Player deposits 1000 HOBO and receives a listing with displayed price
+     * @param listingId Unique identifier for the listing
+     * @param displayedPrice The price shown to the player
      */
-    function play(uint256 betAmount, uint256 threshold, Guess guess) external nonReentrant {
-        require(betAmount >= MIN_BET, "Bet amount too low");
-        require(betAmount <= maxBet, "Bet amount exceeds maximum");
-        require(threshold >= 1 && threshold <= 99, "Threshold must be between 1 and 99");
-        require(houseBalance >= betAmount, "House doesn't have enough balance");
+    function startGame(bytes32 listingId, uint256 displayedPrice) external nonReentrant returns (uint256) {
+        require(listingId != bytes32(0), "Invalid listing ID");
+        require(displayedPrice > 0, "Displayed price must be > 0");
 
-        // Transfer bet from player
-        require(hoboToken.transferFrom(msg.sender, address(this), betAmount), "Transfer failed");
+        // Transfer 1000 HOBO from player
+        require(
+            hoboToken.transferFrom(msg.sender, address(this), GAME_COST),
+            "Transfer failed"
+        );
 
-        // Generate random number (1-100)
-        // WARNING: This is NOT secure randomness - use Chainlink VRF for production
-        uint256 rolledNumber = _generateRandomNumber();
-
-        // Determine if player won
-        bool won = false;
-        if (guess == Guess.UNDER && rolledNumber < threshold) {
-            won = true;
-        } else if (guess == Guess.OVER && rolledNumber > threshold) {
-            won = true;
-        }
-
-        uint256 payout = 0;
-        if (won) {
-            // Player wins 2x their bet
-            payout = betAmount * 2;
-            houseBalance -= betAmount; // House loses the player's winnings
-            require(hoboToken.transfer(msg.sender, payout), "Payout transfer failed");
-        } else {
-            // Player loses, house keeps the bet
-            houseBalance += betAmount;
-        }
-
-        // Record game result
-        GameResult memory result = GameResult({
+        // Create new listing
+        Listing memory newListing = Listing({
+            gameId: nextGameId,
+            displayedPrice: displayedPrice,
+            actualPrice: 0,              // Unknown at this stage
+            higherOrLower: false,        // Not set yet
+            listingId: listingId,
             player: msg.sender,
-            betAmount: betAmount,
-            threshold: threshold,
-            guess: guess,
-            rolledNumber: rolledNumber,
-            won: won,
-            payout: payout,
-            timestamp: block.timestamp
+            timestamp: block.timestamp,
+            stage: GameStage.Initialized,
+            won: false,
+            payout: 0
         });
 
-        playerHistory[msg.sender].push(result);
-        allGames.push(result);
+        // Store the listing
+        playerListings[msg.sender].push(newListing);
+        gameById[nextGameId] = newListing;
+        allGames.push(newListing);
 
-        emit GamePlayed(msg.sender, betAmount, threshold, guess, rolledNumber, won, payout);
+        emit GameStarted(nextGameId, msg.sender, listingId, displayedPrice, block.timestamp);
+
+        uint256 currentGameId = nextGameId;
+        nextGameId++;
+
+        return currentGameId;
     }
 
     /**
-     * @dev Generate a pseudo-random number between 1 and 100
-     * WARNING: Not cryptographically secure - for demo purposes only
+     * @dev STAGE 2: Player makes their guess
+     * @param gameId The game ID
+     * @param isHigher True if player thinks actual price is higher, false if lower
      */
-    function _generateRandomNumber() private view returns (uint256) {
-        uint256 random = uint256(keccak256(abi.encodePacked(
-            block.timestamp,
-            block.prevrandao,
-            msg.sender,
-            allGames.length
-        )));
-        return (random % 100) + 1;
+    function makeGuess(uint256 gameId, bool isHigher) external nonReentrant {
+        require(gameId > 0 && gameId < nextGameId, "Invalid game ID");
+
+        Listing storage game = gameById[gameId];
+        require(game.player == msg.sender, "Not your game");
+        require(game.stage == GameStage.Initialized, "Game not in guess stage");
+
+        // Set the player's guess
+        game.higherOrLower = isHigher;
+        game.stage = GameStage.GuessSubmitted;
+
+        // Update in all storage locations
+        _updateListingInArrays(gameId, game);
+
+        emit GuessMade(gameId, msg.sender, isHigher);
     }
 
     /**
-     * @dev Owner can fund the house balance
-     * @param amount Amount of HOBO tokens to add to house balance
+     * @dev STAGE 3: Owner sets actual price and settles the bet
+     * @param gameId The game ID
+     * @param actualPrice The real price of the listing
      */
-    function fundHouse(uint256 amount) external onlyOwner {
-        require(hoboToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
-        houseBalance += amount;
-        emit HouseFunded(amount);
+    function settleBet(uint256 gameId, uint256 actualPrice) external onlyOwner nonReentrant {
+        require(gameId > 0 && gameId < nextGameId, "Invalid game ID");
+        require(actualPrice > 0, "Actual price must be > 0");
+
+        Listing storage game = gameById[gameId];
+        require(game.stage == GameStage.GuessSubmitted, "Game not ready for settlement");
+
+        game.actualPrice = actualPrice;
+
+        // Determine if player won
+        bool playerWon = false;
+        if (game.higherOrLower && actualPrice > game.displayedPrice) {
+            // Guessed higher and actual is higher
+            playerWon = true;
+        } else if (!game.higherOrLower && actualPrice < game.displayedPrice) {
+            // Guessed lower and actual is lower
+            playerWon = true;
+        } else if (actualPrice == game.displayedPrice) {
+            // Edge case: prices are equal, player wins
+            playerWon = true;
+        }
+
+        game.won = playerWon;
+        game.stage = GameStage.Settled;
+
+        // Calculate payout
+        if (playerWon) {
+            // Player wins 2x their bet
+            game.payout = GAME_COST * 2;
+            require(hoboToken.transfer(game.player, game.payout), "Payout failed");
+        } else {
+            // Player loses, bet stays in contract
+            game.payout = 0;
+        }
+
+        // Update in all storage locations
+        _updateListingInArrays(gameId, game);
+
+        emit BetSettled(
+            gameId,
+            game.player,
+            game.displayedPrice,
+            actualPrice,
+            game.higherOrLower,
+            playerWon,
+            game.payout
+        );
     }
 
     /**
-     * @dev Owner can withdraw from house balance
-     * @param amount Amount of HOBO tokens to withdraw
+     * @dev Update listing in all storage arrays
+     * @param gameId The game ID
+     * @param updatedGame The updated game data
      */
-    function withdrawHouse(uint256 amount) external onlyOwner {
-        require(amount <= houseBalance, "Insufficient house balance");
-        houseBalance -= amount;
-        require(hoboToken.transfer(msg.sender, amount), "Transfer failed");
-        emit HouseWithdrawn(amount);
+    function _updateListingInArrays(uint256 gameId, Listing storage updatedGame) private {
+        // Update in player listings
+        Listing[] storage playerGames = playerListings[updatedGame.player];
+        for (uint256 i = 0; i < playerGames.length; i++) {
+            if (playerGames[i].gameId == gameId) {
+                playerGames[i] = updatedGame;
+                break;
+            }
+        }
+
+        // Update in all games
+        for (uint256 i = 0; i < allGames.length; i++) {
+            if (allGames[i].gameId == gameId) {
+                allGames[i] = updatedGame;
+                break;
+            }
+        }
     }
 
     /**
-     * @dev Update maximum bet amount
-     * @param newMaxBet New maximum bet amount
-     */
-    function setMaxBet(uint256 newMaxBet) external onlyOwner {
-        require(newMaxBet >= MIN_BET, "Max bet must be >= min bet");
-        maxBet = newMaxBet;
-        emit MaxBetUpdated(newMaxBet);
-    }
-
-    /**
-     * @dev Get player's game history
+     * @dev Get all listings for a specific player
      * @param player Address of the player
-     * @return Array of game results for the player
      */
-    function getPlayerHistory(address player) external view returns (GameResult[] memory) {
-        return playerHistory[player];
+    function getPlayerListings(address player) external view returns (Listing[] memory) {
+        return playerListings[player];
     }
 
     /**
-     * @dev Get total number of games played
+     * @dev Get a specific game by ID
+     * @param gameId The game ID
+     */
+    function getGame(uint256 gameId) external view returns (Listing memory) {
+        require(gameId > 0 && gameId < nextGameId, "Invalid game ID");
+        return gameById[gameId];
+    }
+
+    /**
+     * @dev Get total number of games created
      */
     function getTotalGames() external view returns (uint256) {
         return allGames.length;
     }
 
     /**
-     * @dev Get game result by index
-     * @param index Index of the game
+     * @dev Get number of games in specific stage for a player
+     * @param player Address of the player
+     * @param stage The game stage to filter by
      */
-    function getGame(uint256 index) external view returns (GameResult memory) {
-        require(index < allGames.length, "Game index out of bounds");
-        return allGames[index];
+    function getPlayerGamesByStage(address player, GameStage stage) external view returns (uint256) {
+        uint256 count = 0;
+        Listing[] memory listings = playerListings[player];
+
+        for (uint256 i = 0; i < listings.length; i++) {
+            if (listings[i].stage == stage) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /**
+     * @dev Owner can withdraw accumulated HOBO tokens
+     * @param amount Amount to withdraw
+     */
+    function withdrawFunds(uint256 amount) external onlyOwner {
+        require(amount <= hoboToken.balanceOf(address(this)), "Insufficient balance");
+        require(hoboToken.transfer(msg.sender, amount), "Transfer failed");
+    }
+
+    /**
+     * @dev Get contract's HOBO balance
+     */
+    function getContractBalance() external view returns (uint256) {
+        return hoboToken.balanceOf(address(this));
     }
 }

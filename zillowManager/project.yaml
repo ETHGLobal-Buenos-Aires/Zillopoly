@@ -17,11 +17,15 @@
 # ==========================================================================
 staging-settings:
   rpcs:
+    - chain-name: celo-mainnet
+      url: https://rpc.ankr.com/celo
     - chain-name: ethereum-testnet-sepolia
       url: https://ethereum-sepolia-rpc.publicnode.com
 
 # ==========================================================================
 production-settings:
   rpcs:
+    - chain-name: celo-mainnet
+      url: https://rpc.ankr.com/celo
     - chain-name: ethereum-testnet-sepolia
       url: https://ethereum-sepolia-rpc.publicnode.com
