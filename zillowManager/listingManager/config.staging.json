@@ -1,4 +1,5 @@
 {
-  "zillopolyAddress": "0x534A54ee12D956d1beeD54404a46958f8bf93FDB",
-  "chainName": "celo-mainnet"
+  "zillopolyAddress": "0xaB6F3d4c4bd68c8969052312050aD7302c4bbbDa",
+  "chainName": "celo-mainnet",
+  "apiUrl": "http://localhost:3000"
 }

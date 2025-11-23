@@ -1,41 +1,69 @@
 import { cre, Runner, type Runtime } from "@chainlink/cre-sdk";
-import { decodeEventLog, type Hex } from "viem";
+import { decodeEventLog, encodeFunctionData, type Hex, keccak256, toHex } from "viem";
 
-// Zillopoly contract ABI for GamePlayed event
+// Zillopoly contract ABI
 const ZILLOPOLY_ABI = [
   {
     type: "event",
-    name: "GamePlayed",
+    name: "BatchGamesCreated",
     inputs: [
       { name: "player", type: "address", indexed: true },
-      { name: "betAmount", type: "uint256", indexed: false },
-      { name: "threshold", type: "uint256", indexed: false },
-      { name: "guess", type: "uint8", indexed: false },
-      { name: "rolledNumber", type: "uint256", indexed: false },
-      { name: "won", type: "bool", indexed: false },
-      { name: "payout", type: "uint256", indexed: false }
+      { name: "startGameId", type: "uint256", indexed: false },
+      { name: "endGameId", type: "uint256", indexed: false },
+      { name: "timestamp", type: "uint256", indexed: false }
     ]
+  },
+  {
+    type: "function",
+    name: "initializeGame",
+    inputs: [
+      { name: "gameId", type: "uint256" },
+      { name: "listingId", type: "bytes32" },
+      { name: "displayedPrice", type: "uint256" }
+    ],
+    outputs: [],
+    stateMutability: "nonpayable"
   }
 ] as const;
 
 type Config = {
   zillopolyAddress: string;
   chainName: string;
+  apiUrl: string; // URL to the Zillopoly API
 };
 
-type GamePlayedEvent = {
+type BatchGamesCreatedEvent = {
   player: string;
-  betAmount: bigint;
-  threshold: bigint;
-  guess: number;
-  rolledNumber: bigint;
-  won: boolean;
-  payout: bigint;
+  startGameId: bigint;
+  endGameId: bigint;
+  timestamp: bigint;
 };
 
-// Handler for GamePlayed events
-const onGamePlayed = (runtime: Runtime<Config>, payload: cre.capabilities.EVMLogPayload): string => {
-  runtime.log("=== Game Played Event Detected ===");
+type ListingResponse = {
+  success: boolean;
+  city: string;
+  listing: {
+    zpid: number;
+    address: string;
+    price: number;
+    imgSrc: string;
+    bedrooms: number;
+    bathrooms: number;
+    livingArea: number;
+    homeType: string;
+  };
+  contractData: {
+    listingId: string;
+    displayedPrice: number;
+  };
+};
+
+// Handler for BatchGamesCreated events
+const onBatchGamesCreated = async (
+  runtime: Runtime<Config>,
+  payload: cre.capabilities.EVMLogPayload
+): Promise<string> => {
+  runtime.log("=== Batch Games Created Event Detected ===");
 
   try {
     // Decode the event log
@@ -45,63 +73,116 @@ const onGamePlayed = (runtime: Runtime<Config>, payload: cre.capabilities.EVMLog
       topics: payload.topics as [Hex, ...Hex[]],
     });
 
-    const eventData = decodedLog.args as GamePlayedEvent;
+    const eventData = decodedLog.args as BatchGamesCreatedEvent;
 
     runtime.log(`Player: ${eventData.player}`);
-    runtime.log(`Bet Amount: ${eventData.betAmount.toString()} HOBO`);
-    runtime.log(`Threshold: ${eventData.threshold.toString()}`);
-    runtime.log(`Guess: ${eventData.guess === 0 ? 'UNDER' : 'OVER'}`);
-    runtime.log(`Rolled Number: ${eventData.rolledNumber.toString()}`);
-    runtime.log(`Won: ${eventData.won}`);
-    runtime.log(`Payout: ${eventData.payout.toString()} HOBO`);
+    runtime.log(`Start Game ID: ${eventData.startGameId.toString()}`);
+    runtime.log(`End Game ID: ${eventData.endGameId.toString()}`);
+    runtime.log(`Timestamp: ${eventData.timestamp.toString()}`);
     runtime.log(`Block Number: ${payload.blockNumber}`);
     runtime.log(`Transaction Hash: ${payload.transactionHash}`);
 
-    // Return a summary for the workflow
-    const result = {
-      event: "GamePlayed",
+    const numGames = Number(eventData.endGameId - eventData.startGameId + 1n);
+    runtime.log(`Fetching ${numGames} listings from API...`);
+
+    // Initialize HTTP and EVM capabilities
+    const http = new cre.capabilities.HTTPCapability();
+    const evm = new cre.capabilities.EVMCapability();
+
+    const results = [];
+
+    // Fetch listings and initialize games
+    for (let i = 0; i < numGames; i++) {
+      const currentGameId = eventData.startGameId + BigInt(i);
+
+      runtime.log(`Fetching listing ${i + 1}/${numGames} for game ID ${currentGameId}...`);
+
+      // Fetch random listing from API
+      const response = await http.fetch({
+        url: `${runtime.config.apiUrl}/api/random-listing`,
+        method: "GET",
+        headers: {},
+      });
+
+      if (!response.ok || response.statusCode !== 200) {
+        runtime.log(`Failed to fetch listing ${i + 1}: ${response.statusCode}`);
+        results.push({ gameId: currentGameId.toString(), status: "failed", error: "API request failed" });
+        continue;
+      }
+
+      const listingData: ListingResponse = JSON.parse(response.body);
+
+      if (!listingData.success) {
+        runtime.log(`Failed to get listing ${i + 1}: ${listingData}`);
+        results.push({ gameId: currentGameId.toString(), status: "failed", error: "No listing data" });
+        continue;
+      }
+
+      runtime.log(`Got listing from ${listingData.city}: $${listingData.contractData.displayedPrice}`);
+
+      // Encode the initializeGame function call
+      const calldata = encodeFunctionData({
+        abi: ZILLOPOLY_ABI,
+        functionName: "initializeGame",
+        args: [
+          currentGameId,
+          listingData.contractData.listingId as Hex,
+          BigInt(listingData.contractData.displayedPrice),
+        ],
+      });
+
+      runtime.log(`Initializing game ${currentGameId} with listing ${listingData.listing.zpid}...`);
+
+      // Send transaction to initialize the game
+      const txResponse = await evm.write({
+        chainName: runtime.config.chainName,
+        to: runtime.config.zillopolyAddress,
+        data: calldata,
+      });
+
+      runtime.log(`Game ${currentGameId} initialized. Tx: ${txResponse.transactionHash}`);
+
+      results.push({
+        gameId: currentGameId.toString(),
+        status: "success",
+        listingId: listingData.listing.zpid,
+        city: listingData.city,
+        displayedPrice: listingData.contractData.displayedPrice,
+        txHash: txResponse.transactionHash,
+      });
+    }
+
+    const summary = {
+      event: "BatchGamesCreated",
       player: eventData.player,
-      won: eventData.won,
-      betAmount: eventData.betAmount.toString(),
-      payout: eventData.payout.toString(),
-      rolledNumber: eventData.rolledNumber.toString(),
-      timestamp: new Date().toISOString()
+      startGameId: eventData.startGameId.toString(),
+      endGameId: eventData.endGameId.toString(),
+      totalGames: numGames,
+      results,
+      timestamp: new Date().toISOString(),
     };
 
-    return JSON.stringify(result, null, 2);
+    return JSON.stringify(summary, null, 2);
   } catch (error) {
-    runtime.log(`Error decoding event: ${error}`);
+    runtime.log(`Error processing batch games: ${error}`);
     return JSON.stringify({ error: String(error) });
   }
 };
 
-// Optional: Cron trigger for periodic checks (keeping the original functionality)
-const onCronTrigger = (runtime: Runtime<Config>): string => {
-  runtime.log("Periodic workflow check triggered");
-  return "Workflow is active and monitoring GamePlayed events";
-};
-
 const initWorkflow = (config: Config) => {
-  const cron = new cre.capabilities.CronCapability();
   const evm = new cre.capabilities.EVMCapability();
 
   return [
-    // EVM Log Trigger for GamePlayed events
+    // EVM Log Trigger for BatchGamesCreated events
     cre.handler(
       evm.logTrigger({
         chainName: config.chainName,
         addresses: [config.zillopolyAddress],
         topics: {
-          0: ["0x" + "GamePlayed(address,uint256,uint256,uint8,uint256,bool,uint256)"],
+          0: [keccak256(toHex("BatchGamesCreated(address,uint256,uint256,uint256)"))],
         }
       }),
-      onGamePlayed
-    ),
-
-    // Optional: Keep cron trigger for health checks
-    cre.handler(
-      cron.trigger({ schedule: "0 */6 * * *" }), // Every 6 hours
-      onCronTrigger
+      onBatchGamesCreated
     ),
   ];
 };

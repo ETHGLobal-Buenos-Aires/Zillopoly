@@ -16,6 +16,8 @@ contract Zillopoly is Ownable, ReentrancyGuard {
     IERC20 public hoboToken;
 
     uint256 public constant GAME_COST = 1000 * 10**18; // 1000 HOBO tokens
+    uint256 public constant BATCH_SIZE = 10; // Number of games per batch
+    uint256 public constant BATCH_COST = GAME_COST * BATCH_SIZE; // 10,000 HOBO tokens
     uint256 public nextGameId = 1;
 
     enum GameStage {
@@ -47,7 +49,14 @@ contract Zillopoly is Ownable, ReentrancyGuard {
     // All games ever created
     Listing[] public allGames;
 
-    event GameStarted(
+    event BatchGamesCreated(
+        address indexed player,
+        uint256 startGameId,
+        uint256 endGameId,
+        uint256 timestamp
+    );
+
+    event GameInitialized(
         uint256 indexed gameId,
         address indexed player,
         bytes32 indexed listingId,
@@ -76,46 +85,76 @@ contract Zillopoly is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev STAGE 1: Initialize game with listing
-     * Player deposits 1000 HOBO and receives a listing with displayed price
-     * @param listingId Unique identifier for the listing
-     * @param displayedPrice The price shown to the player
+     * @dev Create batch of 10 empty games
+     * Player deposits 10,000 HOBO and receives 10 game slots
+     * CRE will initialize these games with listing data
      */
-    function startGame(bytes32 listingId, uint256 displayedPrice) external nonReentrant returns (uint256) {
-        require(listingId != bytes32(0), "Invalid listing ID");
-        require(displayedPrice > 0, "Displayed price must be > 0");
-
-        // Transfer 1000 HOBO from player
+    function startGame() external nonReentrant returns (uint256, uint256) {
+        // Transfer 10,000 HOBO from player
         require(
-            hoboToken.transferFrom(msg.sender, address(this), GAME_COST),
+            hoboToken.transferFrom(msg.sender, address(this), BATCH_COST),
             "Transfer failed"
         );
 
-        // Create new listing
-        Listing memory newListing = Listing({
-            gameId: nextGameId,
-            displayedPrice: displayedPrice,
-            actualPrice: 0,              // Unknown at this stage
-            higherOrLower: false,        // Not set yet
-            listingId: listingId,
-            player: msg.sender,
-            timestamp: block.timestamp,
-            stage: GameStage.Initialized,
-            won: false,
-            payout: 0
-        });
+        uint256 startGameId = nextGameId;
 
-        // Store the listing
-        playerListings[msg.sender].push(newListing);
-        gameById[nextGameId] = newListing;
-        allGames.push(newListing);
+        // Create 10 empty game slots
+        for (uint256 i = 0; i < BATCH_SIZE; i++) {
+            Listing memory newListing = Listing({
+                gameId: nextGameId,
+                displayedPrice: 0,           // Will be set by CRE
+                actualPrice: 0,
+                higherOrLower: false,
+                listingId: bytes32(0),       // Will be set by CRE
+                player: msg.sender,
+                timestamp: block.timestamp,
+                stage: GameStage.NotStarted,
+                won: false,
+                payout: 0
+            });
 
-        emit GameStarted(nextGameId, msg.sender, listingId, displayedPrice, block.timestamp);
+            // Store the listing
+            playerListings[msg.sender].push(newListing);
+            gameById[nextGameId] = newListing;
+            allGames.push(newListing);
 
-        uint256 currentGameId = nextGameId;
-        nextGameId++;
+            nextGameId++;
+        }
 
-        return currentGameId;
+        uint256 endGameId = nextGameId - 1;
+
+        emit BatchGamesCreated(msg.sender, startGameId, endGameId, block.timestamp);
+
+        return (startGameId, endGameId);
+    }
+
+    /**
+     * @dev Initialize a game with listing data (called by owner/CRE)
+     * @param gameId The game ID to initialize
+     * @param listingId Unique identifier for the listing
+     * @param displayedPrice The price shown to the player
+     */
+    function initializeGame(
+        uint256 gameId,
+        bytes32 listingId,
+        uint256 displayedPrice
+    ) external onlyOwner nonReentrant {
+        require(gameId > 0 && gameId < nextGameId, "Invalid game ID");
+        require(listingId != bytes32(0), "Invalid listing ID");
+        require(displayedPrice > 0, "Displayed price must be > 0");
+
+        Listing storage game = gameById[gameId];
+        require(game.stage == GameStage.NotStarted, "Game already initialized");
+
+        // Set listing data
+        game.listingId = listingId;
+        game.displayedPrice = displayedPrice;
+        game.stage = GameStage.Initialized;
+
+        // Update in all storage locations
+        _updateListingInArrays(gameId, game);
+
+        emit GameInitialized(gameId, game.player, listingId, displayedPrice, block.timestamp);
     }
 
     /**

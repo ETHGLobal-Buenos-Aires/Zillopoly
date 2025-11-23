@@ -41,6 +41,35 @@ const MAJOR_CITIES = [
 ];
 
 /**
+ * Generates a random percentage between -15% and +15%
+ * Uses Math.js API for random number generation
+ * @returns {Promise<number>} Random percentage adjustment (-15 to +15)
+ */
+async function getRandomPercentageAdjustment() {
+  try {
+    // Get random number between 1 and 100 (representing 0.01 to 1.00)
+    const response = await fetch('https://api.mathjs.org/v4/?expr=randomInt(1,101)');
+
+    if (!response.ok) {
+      throw new Error('Math.js API failed');
+    }
+
+    const randomValue = await response.text();
+    const normalized = parseInt(randomValue.trim()) / 100; // 0.01 to 1.00
+
+    // Map to -15% to +15% range
+    // normalized is 0.01 to 1.00, we want -0.15 to 0.15
+    const adjustment = (normalized * 0.30) - 0.15; // Scale to 0.30 range, then shift down by 0.15
+
+    return adjustment;
+  } catch (error) {
+    console.error('Error getting random adjustment from Math.js API:', error);
+    // Fallback to Math.random if API fails
+    return (Math.random() * 0.30) - 0.15;
+  }
+}
+
+/**
  * Fetches a random real estate listing from Zillow API
  * Randomly selects a city from MAJOR_CITIES array
  * @returns {Promise<Object>} Listing data from Zillow
@@ -77,6 +106,17 @@ async function fetchRandomListing() {
     if (data.props && data.props.length > 0) {
       const randomListing = data.props[Math.floor(Math.random() * data.props.length)];
 
+      // Get actual price
+      const actualPrice = randomListing.price || 0;
+
+      // Generate displayed price with ±15% adjustment
+      const adjustment = await getRandomPercentageAdjustment();
+      const displayedPrice = Math.round(actualPrice * (1 + adjustment));
+
+      console.log(`Actual Price: $${actualPrice.toLocaleString()}`);
+      console.log(`Adjustment: ${(adjustment * 100).toFixed(2)}%`);
+      console.log(`Displayed Price: $${displayedPrice.toLocaleString()}`);
+
       // Format the listing data for our contract
       return {
         success: true,
@@ -84,7 +124,7 @@ async function fetchRandomListing() {
         listing: {
           zpid: randomListing.zpid, // Zillow Property ID
           address: randomListing.address,
-          price: randomListing.price,
+          price: actualPrice, // The ACTUAL price (hidden from player initially)
           imgSrc: randomListing.imgSrc,
           bedrooms: randomListing.bedrooms,
           bathrooms: randomListing.bathrooms,
@@ -96,7 +136,13 @@ async function fetchRandomListing() {
         // Contract-ready format
         contractData: {
           listingId: `0x${randomListing.zpid.toString().padStart(64, '0')}`, // Convert zpid to bytes32
-          displayedPrice: randomListing.price || 0
+          displayedPrice: displayedPrice, // The DISPLAYED price (shown to player, ±15% of actual)
+          actualPrice: actualPrice // Include actual price for reference
+        },
+        priceInfo: {
+          actual: actualPrice,
+          displayed: displayedPrice,
+          adjustmentPercent: (adjustment * 100).toFixed(2)
         }
       };
     } else {
