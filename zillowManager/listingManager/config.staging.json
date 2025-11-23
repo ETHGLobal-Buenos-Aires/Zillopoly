@@ -1,5 +1,5 @@
 {
   "zillopolyAddress": "0xaB6F3d4c4bd68c8969052312050aD7302c4bbbDa",
   "chainName": "celo-mainnet",
-  "apiUrl": "http://localhost:3000"
+  "apiUrl": "https://ee75193d87d3.ngrok-free.app"
 }
